@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Whisper GUI: faster-whisper + Hugging Face model download (PySide6).
+"""Whisper GUI, wxPython edition: faster-whisper + Hugging Face model download.
 
-    pip install -U pyside6 faster-whisper huggingface_hub
-    python whisper_gui.py
+    pip install -U wxPython faster-whisper huggingface_hub
+    python whisper_gui_wx.py
 """
 import ctypes
 import gc
@@ -24,6 +24,8 @@ if sys.stderr is None:
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import faster_whisper
+import wx
+import wx.lib.scrolledpanel as scrolled
 from faster_whisper import WhisperModel
 
 try:
@@ -31,15 +33,6 @@ try:
 except ImportError:  # faster-whisper < 1.1
     BatchedInferencePipeline = None
 from huggingface_hub import HfApi, snapshot_download
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
-)
 from tqdm.auto import tqdm
 
 MODELS = {
@@ -49,6 +42,7 @@ MODELS = {
 MEDIA_EXT = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma",
              ".mp4", ".mkv", ".webm", ".mov", ".avi")
 RTL_LANGS = {"he", "ar", "fa", "ur"}
+FORMATS = ("txt", "srt", "vtt", "json")
 
 _MODELS = {}  # (spec, device, compute, threads) -> [WhisperModel, BatchedInferencePipeline | None]
 _DEVNULL = open(os.devnull, "w")
@@ -110,51 +104,87 @@ def probe(path):
     return None
 
 
-def hbox(*items):
-    """Row helper: str -> label, '-' -> stretch, (widget, stretch) -> weighted widget."""
-    lay = QHBoxLayout()
-    lay.setContentsMargins(0, 0, 0, 0)
-    for it in items:
-        if isinstance(it, str):
-            lay.addStretch() if it == "-" else lay.addWidget(QLabel(it))
-        elif isinstance(it, tuple):
-            lay.addWidget(it[0], it[1])
-        else:
-            lay.addWidget(it)
-    return lay
+def keep_awake(on):
+    """Windows: stop the PC sleeping during a long transcription."""
+    if sys.platform == "win32":
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+
+
+def data_dir():
+    d = wx.StandardPaths.Get().GetUserDataDir()  # Windows: %APPDATA%\WhisperGUI
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def install_crash_handler():
+    """Windowed exes swallow exceptions; log them to a file and show a dialog instead."""
+    def hook(et, ev, tb):
+        text = "".join(traceback.format_exception(et, ev, tb))
+        try:
+            d = data_dir()
+            with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.now()} ---\n{text}")
+            wx.MessageBox(f"{ev}\n\nDetails were saved to {d}", "Unexpected error", wx.ICON_ERROR)
+        except Exception:
+            pass
+    sys.excepthook = hook
 
 
 def getv(w):
-    if isinstance(w, QComboBox):
-        return w.currentText()
-    if isinstance(w, QCheckBox):
-        return w.isChecked()
-    if isinstance(w, QSpinBox):
-        return w.value()
-    return w.text()
+    return w.GetValue()
 
 
 def setv(w, v):
     try:
-        if isinstance(w, QComboBox):
-            w.setCurrentText(str(v))
-        elif isinstance(w, QCheckBox):
-            w.setChecked(str(v).lower() in ("true", "1"))
-        elif isinstance(w, QSpinBox):
-            w.setValue(int(v))
+        if isinstance(w, wx.CheckBox):
+            w.SetValue(str(v).lower() in ("true", "1"))
+        elif isinstance(w, wx.SpinCtrl):
+            w.SetValue(int(v))
         else:
-            w.setText(str(v))
-    except (TypeError, ValueError):
+            w.SetValue(str(v))
+    except (TypeError, ValueError, RuntimeError):
         pass
+
+
+def hrow(parent, *items):
+    """Row helper: str -> label, '-' -> stretch, (widget, stretch) -> weighted widget."""
+    s = wx.BoxSizer(wx.HORIZONTAL)
+    for it in items:
+        if isinstance(it, str):
+            if it == "-":
+                s.AddStretchSpacer(1)
+            else:
+                s.Add(wx.StaticText(parent, label=it), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        elif isinstance(it, tuple):
+            s.Add(it[0], it[1], wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        else:
+            s.Add(it, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+    return s
+
+
+class Settings:
+    def __init__(self, d):
+        self.path = os.path.join(d, "settings_wx.json")
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                self.data = json.load(f)
+        except (OSError, ValueError):
+            self.data = {}
+
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
 
 
 # ----------------------------------------------------------- timing history
 class Timings:
     """Append-only JSONL log of every run. Used to predict future run times."""
 
-    def __init__(self):
-        d = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        os.makedirs(d, exist_ok=True)
+    def __init__(self, d):
         self.dir, self.path = d, os.path.join(d, "timings.jsonl")
         self.records = []
         if os.path.exists(self.path):
@@ -209,19 +239,30 @@ def make_tqdm(on_bytes):
     return ByteTqdm
 
 
-class Worker(QThread):
-    bar = Signal(str, int, str)           # which bar, percent (-1 = busy), detail
-    status = Signal(str)
-    log = Signal(str)
-    loadstart = Signal(float)             # predicted load seconds (0 = unknown)
-    filestart = Signal(int)
-    segment = Signal(int, object)
-    result = Signal(int, object, object)  # file index, segments, timing record
-    record = Signal(object)
-    failed = Signal(str)
+class Sig:
+    """Calls a UI method on the main thread (the wx stand-in for a Qt signal)."""
 
-    def __init__(self, spec, files, opts, pred, download_only=False):
-        super().__init__()
+    def __init__(self, ui, fn):
+        self.ui, self.fn = ui, fn
+
+    def emit(self, *a):
+        if not self.ui.closing:
+            wx.CallAfter(self.fn, *a)
+
+
+class Worker(threading.Thread):
+    def __init__(self, ui, spec, files, opts, pred, download_only=False):
+        super().__init__(daemon=True)
+        self.ui = ui
+        self.bar = Sig(ui, ui.on_bar)               # which bar, percent (-1 = busy), detail
+        self.status = Sig(ui, ui.set_status)
+        self.log = Sig(ui, ui.logline)
+        self.loadstart = Sig(ui, ui.on_loadstart)   # predicted load seconds (0 = unknown)
+        self.filestart = Sig(ui, ui.on_filestart)
+        self.segment = Sig(ui, ui.on_segment)
+        self.result = Sig(ui, ui.on_result)         # file index, segments, timing record
+        self.record = Sig(ui, ui.on_record)
+        self.failed = Sig(ui, ui.on_failed)
         self.spec, self.files, self.o, self.pred = spec, files, opts, pred
         self.download_only = download_only
         self.cancel = False
@@ -231,6 +272,13 @@ class Worker(QThread):
         self.cancel = True
 
     def run(self):
+        try:
+            self.work()
+        finally:
+            if not self.ui.closing:
+                wx.CallAfter(self.ui.on_finished)
+
+    def work(self):
         t0 = time.time()
         try:
             path = self.fetch()
@@ -396,320 +444,323 @@ class Worker(QThread):
             self.log.emit(f"ERROR {name}: {type(e).__name__}: {e}")
 
 
-def keep_awake(on):
-    """Windows: stop the PC sleeping during a long transcription."""
-    if sys.platform == "win32":
-        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
-
-
-def install_crash_handler():
-    """Windowed exes swallow exceptions; log them to a file and show a dialog instead."""
-    def hook(et, ev, tb):
-        text = "".join(traceback.format_exception(et, ev, tb))
-        try:
-            d = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
-                f.write(f"\n--- {datetime.now()} ---\n{text}")
-            QMessageBox.critical(None, "Unexpected error", f"{ev}\n\nDetails were saved to {d}")
-        except Exception:
-            pass
-    sys.excepthook = hook
-
-
 # ------------------------------------------------------------ timing dialog
-class TimingDialog(QDialog):
+class TimingDialog(wx.Dialog):
     def __init__(self, parent, timings):
-        super().__init__(parent)
-        self.setWindowTitle("Timing history")
-        self.resize(900, 380)
+        super().__init__(parent, title="Timing history", size=(900, 400),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.parent, self.timings = parent, timings
         groups = {}
         for r in timings.records:
             if r.get("kind") == "transcribe":
                 k = (r["model"], r["device"], r["compute"], r["batched"], r["threads"])
                 groups.setdefault(k, []).append(r)
-        heads = ["Model", "Device", "Compute", "Batched", "Threads", "Runs", "Audio", "Speed", "Load"]
-        t = QTableWidget(len(groups), len(heads))
-        t.setHorizontalHeaderLabels(heads)
-        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        for row, (k, rs) in enumerate(groups.items()):
+        heads = [("Model", 260), ("Device", 60), ("Compute", 90), ("Batched", 60), ("Threads", 60),
+                 ("Runs", 50), ("Audio", 70), ("Speed", 120), ("Load", 60)]
+        lc = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
+        for c, (h, w) in enumerate(heads):
+            lc.InsertColumn(c, h, width=w)
+        for k, rs in groups.items():
             rtfs = [r["rtf"] for r in rs if r.get("rtf")]
             loads = [r["load_seconds"] for r in rs if r.get("load_cold") and r.get("load_seconds")]
-            vals = [k[0], k[1], k[2], "yes" if k[3] else "no", k[4] or "auto", len(rs),
+            vals = [k[0], k[1], k[2], "yes" if k[3] else "no", k[4] or "default", len(rs),
                     hms(sum(r["audio_seconds"] for r in rs)),
                     f"{1 / statistics.median(rtfs):.2f}× realtime" if rtfs else "-",
                     hms(statistics.median(loads)) if loads else "-"]
-            for c, v in enumerate(vals):
-                t.setItem(row, c, QTableWidgetItem(str(v)))
-        t.resizeColumnsToContents()
-        t.horizontalHeader().setStretchLastSection(True)
+            idx = lc.InsertItem(lc.GetItemCount(), str(vals[0]))
+            for c, v in enumerate(vals[1:], 1):
+                lc.SetItem(idx, c, str(v))
 
-        b_open = QPushButton("Open data folder")
-        b_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(timings.dir)))
-        b_clear = QPushButton("Clear history")
-        b_clear.clicked.connect(lambda: self.clear(parent, timings))
-        path = QLabel(timings.path)
-        path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lay = QVBoxLayout(self)
-        lay.addWidget(t)
-        lay.addLayout(hbox(b_open, b_clear, "-"))
-        lay.addWidget(path)
+        b_open = wx.Button(self, label="Open data folder")
+        b_open.Bind(wx.EVT_BUTTON, lambda e: wx.LaunchDefaultApplication(timings.dir))
+        b_clear = wx.Button(self, label="Clear history")
+        b_clear.Bind(wx.EVT_BUTTON, self.on_clear)
+        path = wx.StaticText(self, label=timings.path)
+        v = wx.BoxSizer(wx.VERTICAL)
+        v.Add(lc, 1, wx.EXPAND | wx.ALL, 6)
+        v.Add(hrow(self, b_open, b_clear), 0, wx.ALL, 6)
+        v.Add(path, 0, wx.LEFT | wx.BOTTOM, 8)
+        self.SetSizer(v)
 
-    def clear(self, parent, timings):
-        if QMessageBox.question(self, "Clear history", "Delete all timing data?") == QMessageBox.Yes:
-            timings.clear()
-            parent.refresh_estimate()
-            self.close()
+    def on_clear(self, e):
+        if wx.MessageBox("Delete all timing data?", "Clear history", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+            self.timings.clear()
+            self.parent.refresh_estimate()
+            self.EndModal(wx.ID_OK)
+
+
+class FileDrop(wx.FileDropTarget):
+    def __init__(self, ui):
+        super().__init__()
+        self.ui = ui
+
+    def OnDropFiles(self, x, y, filenames):
+        self.ui.add_paths(list(filenames))
+        return True
 
 
 # --------------------------------------------------------------- main window
-class Main(QMainWindow):
+class Main(wx.Frame):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Whisper GUI")
-        self.resize(1000, 900)
-        self.setAcceptDrops(True)
-        self.timings = Timings()
-        self.settings = QSettings("WhisperGUI", "WhisperGUI")
+        super().__init__(None, title="Whisper GUI", size=(1000, 900))
+        self.closing = False
+        self.timings = Timings(data_dir())
+        self.settings = Settings(data_dir())
         self.job = None
-        self.results, self.durations = {}, {}
+        self.files, self.results, self.durations = [], {}, {}
+        self.cur = -1
+        self.pulsing, self.load_active = set(), False
         self.load_t0 = self.load_pred = 0.0
-        self.load_timer = QTimer(self, interval=200)
-        self.load_timer.timeout.connect(self.tick_load)
+
+        P = self.panel = scrolled.ScrolledPanel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+
+        def group(title):
+            box = wx.StaticBoxSizer(wx.VERTICAL, P, title)
+            root.Add(box, 0, wx.EXPAND | wx.ALL, 4)
+            return box, box.GetStaticBox()
+
+        def add(box, sizer_or_win):
+            box.Add(sizer_or_win, 0, wx.EXPAND | wx.ALL, 3)
 
         # --- model
-        self.model = QComboBox(editable=True)
-        for i, (rid, tip) in enumerate(MODELS.items()):
-            self.model.addItem(rid)
-            self.model.setItemData(i, tip, Qt.ToolTipRole)
-        self.model.setToolTip("Hugging Face repo ID (downloaded automatically) or a local CTranslate2 folder")
-        b_dir = QPushButton("Local folder...")
-        b_dir.clicked.connect(self.pick_model_dir)
-        self.b_dl = QPushButton("Download only")
-        self.b_dl.setToolTip("Fetch the model into the Hugging Face cache without transcribing")
-        self.b_dl.clicked.connect(lambda: self.start(download_only=True))
-        self.g_model = QGroupBox("Model")
-        QVBoxLayout(self.g_model).addLayout(hbox("Hugging Face repo or folder", (self.model, 1), b_dir, self.b_dl))
+        gm, S = group("Model")
+        self.g_model = S
+        first = next(iter(MODELS))
+        self.model = wx.ComboBox(S, choices=list(MODELS), style=wx.CB_DROPDOWN, value=first)
+        self.model.SetToolTip("Hugging Face repo ID (downloaded automatically) or a local CTranslate2 folder")
+        self.model_help = wx.StaticText(S, label=MODELS[first])
+        b_dir = wx.Button(S, label="Local folder...")
+        b_dir.Bind(wx.EVT_BUTTON, self.pick_model_dir)
+        b_dl = wx.Button(S, label="Download only")
+        b_dl.SetToolTip("Fetch the model into the Hugging Face cache without transcribing")
+        b_dl.Bind(wx.EVT_BUTTON, lambda e: self.start(download_only=True))
+        add(gm, hrow(S, "Hugging Face repo or folder", (self.model, 1), b_dir, b_dl))
+        gm.Add(self.model_help, 0, wx.LEFT | wx.BOTTOM, 8)
 
         # --- options
-        self.device = QComboBox()
-        self.device.addItems(["cpu", "cuda", "auto"])
-        self.compute = QComboBox()
-        self.compute.addItems(["int8", "float16", "int8_float16", "float32", "default"])
-        self.threads = QSpinBox()
-        self.threads.setRange(0, 64)
-        self.threads.setSpecialValueText("default (4)")
-        self.threads.setValue(max(4, (os.cpu_count() or 8) // 2))  # ~physical cores; CTranslate2's own default is 4
-        self.threads.setToolTip("Try a few values: the Timing history table compares them")
-        self.lang = QComboBox(editable=True)
-        self.lang.addItems(["he", "en", "ar", "ru", "es", "fr", "de", "auto"])
-        self.beam = QSpinBox()
-        self.beam.setRange(1, 10)
-        self.beam.setValue(5)
-        self.vad = QCheckBox("VAD (skip silence)")
-        self.vad.setChecked(True)
-        self.words = QCheckBox("Word timestamps")
-        self.cond = QCheckBox("Condition on previous text")
-        self.cond.setToolTip("Off reduces repetition loops/hallucinations; on can improve consistency")
-        self.batched = QCheckBox("Batched mode")
-        self.batched.setToolTip("Mostly worth it on GPU. Needs faster-whisper >= 1.1; ignores 'condition on previous text'.")
-        self.batched.setEnabled(BatchedInferencePipeline is not None)
-        self.bsize = QSpinBox()
-        self.bsize.setRange(1, 64)
-        self.bsize.setValue(8)
-        self.prompt = QLineEdit(placeholderText="Initial prompt: a natural sentence with names/terms, only affects the start (optional)")
-        self.hotwords = QLineEdit(placeholderText="Hotwords: names/terms to favor across the whole file, e.g. כהן Kubernetes (optional)")
-        self.g_opts = QGroupBox("Options")
-        lay = QVBoxLayout(self.g_opts)
-        lay.addLayout(hbox("Device", self.device, "Compute", self.compute, "CPU threads", self.threads,
-                           "Language", self.lang, "-"))
-        lay.addLayout(hbox("Beam", self.beam, self.vad, self.words, self.cond, "-"))
-        lay.addLayout(hbox(self.batched, "batch size", self.bsize, "-"))
-        lay.addWidget(self.prompt)
-        lay.addWidget(self.hotwords)
+        go, S = group("Options")
+        self.g_opts = S
+        self.device = wx.ComboBox(S, choices=["cpu", "cuda", "auto"], style=wx.CB_READONLY, value="cpu")
+        self.compute = wx.ComboBox(S, choices=["int8", "float16", "int8_float16", "float32", "default"],
+                                   style=wx.CB_READONLY, value="int8")
+        self.threads = wx.SpinCtrl(S, min=0, max=64, size=(70, -1),
+                                   initial=max(4, (os.cpu_count() or 8) // 2))
+        self.threads.SetToolTip("0 = CTranslate2 default (4). Try a few values: the Timing history table compares them")
+        self.lang = wx.ComboBox(S, choices=["he", "en", "ar", "ru", "es", "fr", "de", "auto"],
+                                style=wx.CB_DROPDOWN, value="he")
+        self.beam = wx.SpinCtrl(S, min=1, max=10, initial=5, size=(60, -1))
+        self.vad = wx.CheckBox(S, label="VAD (skip silence)")
+        self.vad.SetValue(True)
+        self.words = wx.CheckBox(S, label="Word timestamps")
+        self.cond = wx.CheckBox(S, label="Condition on previous text")
+        self.cond.SetToolTip("Off reduces repetition loops/hallucinations; on can improve consistency")
+        self.batched = wx.CheckBox(S, label="Batched mode")
+        self.batched.SetToolTip("Mostly worth it on GPU. Needs faster-whisper >= 1.1.")
+        self.batched.Enable(BatchedInferencePipeline is not None)
+        self.bsize = wx.SpinCtrl(S, min=1, max=64, initial=8, size=(60, -1))
+        self.prompt = wx.TextCtrl(S)
+        self.prompt.SetHint("Initial prompt: a natural sentence with names/terms, only affects the start (optional)")
+        self.hotwords = wx.TextCtrl(S)
+        self.hotwords.SetHint("Hotwords: names/terms to favor across the whole file, e.g. כהן Kubernetes (optional)")
+        add(go, hrow(S, "Device", self.device, "Compute", self.compute, "CPU threads", self.threads,
+                     "Language", self.lang))
+        add(go, hrow(S, "Beam", self.beam, self.vad, self.words, self.cond))
+        add(go, hrow(S, self.batched, "batch size", self.bsize))
+        add(go, self.prompt)
+        add(go, self.hotwords)
 
         # --- queue
-        self.queue = QListWidget()
-        self.queue.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.queue.setMinimumHeight(90)
-        self.queue.currentRowChanged.connect(self.show_current)
-        b_add, b_rm, b_clr = QPushButton("Add files..."), QPushButton("Remove selected"), QPushButton("Clear")
-        b_add.clicked.connect(self.pick_files)
-        b_rm.clicked.connect(self.remove_selected)
-        b_clr.clicked.connect(self.clear_queue)
+        gq, S = group("Files (drag and drop here; folders work too)")
+        self.queue = wx.ListBox(S, style=wx.LB_EXTENDED, size=(-1, 110))
+        self.queue.Bind(wx.EVT_LISTBOX, self.on_queue_select)
+        b_add, b_rm, b_clr = (wx.Button(S, label=t) for t in ("Add files...", "Remove selected", "Clear"))
+        b_add.Bind(wx.EVT_BUTTON, self.pick_files)
+        b_rm.Bind(wx.EVT_BUTTON, self.remove_selected)
+        b_clr.Bind(wx.EVT_BUTTON, self.clear_queue)
         self.qbtns = [b_add, b_rm, b_clr]
-        g_q = QGroupBox("Files (drag and drop here; folders work too)")
-        lq = QVBoxLayout(g_q)
-        lq.addWidget(self.queue)
-        lq.addLayout(hbox(b_add, b_rm, b_clr, "-"))
+        gq.Add(self.queue, 1, wx.EXPAND | wx.ALL, 3)
+        add(gq, hrow(S, b_add, b_rm, b_clr))
 
         # --- auto-save
-        self.fmt = {f: QCheckBox(f) for f in ("txt", "srt", "vtt", "json")}
-        self.fmt["txt"].setChecked(True)
-        self.outdir = QLineEdit(placeholderText="Next to each audio file")
-        b_out = QPushButton("Browse...")
-        b_out.clicked.connect(self.pick_outdir)
-        self.g_out = QGroupBox("Auto-save results (existing files are overwritten)")
-        QVBoxLayout(self.g_out).addLayout(hbox("Formats", *self.fmt.values(), "Folder", (self.outdir, 1), b_out))
+        gs, S = group("Auto-save results (existing files are overwritten)")
+        self.g_out = S
+        self.fmt = {f: wx.CheckBox(S, label=f) for f in FORMATS}
+        self.fmt["txt"].SetValue(True)
+        self.outdir = wx.TextCtrl(S)
+        self.outdir.SetHint("Next to each audio file")
+        b_out = wx.Button(S, label="Browse...")
+        b_out.Bind(wx.EVT_BUTTON, self.pick_outdir)
+        add(gs, hrow(S, "Formats", *self.fmt.values(), "Folder", (self.outdir, 1), b_out))
 
         # --- controls
-        self.b_start = QPushButton("Transcribe")
-        self.b_start.setStyleSheet("font-weight: bold; padding: 6px 18px;")
-        self.b_start.clicked.connect(lambda: self.start())
-        self.b_stop = QPushButton("Stop")
-        self.b_stop.setEnabled(False)
-        self.b_stop.clicked.connect(lambda: self.job and self.job.stop())
-        self.b_unload = QPushButton("Unload model")
-        self.b_unload.setToolTip("Free the RAM used by the loaded model")
-        self.b_unload.clicked.connect(self.unload)
-        b_hist = QPushButton("Timing history...")
-        b_hist.clicked.connect(lambda: TimingDialog(self, self.timings).exec())
-        self.est = QLabel()
-        self.est.setWordWrap(True)
+        self.b_start = wx.Button(P, label="Transcribe")
+        self.b_start.SetFont(self.b_start.GetFont().Bold())
+        self.b_start.Bind(wx.EVT_BUTTON, lambda e: self.start())
+        self.b_stop = wx.Button(P, label="Stop")
+        self.b_stop.Enable(False)
+        self.b_stop.Bind(wx.EVT_BUTTON, lambda e: self.job and self.job.stop())
+        self.b_unload = wx.Button(P, label="Unload model")
+        self.b_unload.SetToolTip("Free the RAM used by the loaded model")
+        self.b_unload.Bind(wx.EVT_BUTTON, self.unload)
+        b_hist = wx.Button(P, label="Timing history...")
+        b_hist.Bind(wx.EVT_BUTTON, lambda e: TimingDialog(self, self.timings).ShowModal())
+        root.Add(hrow(P, self.b_start, self.b_stop, self.b_unload, b_hist), 0, wx.ALL, 6)
+        self.est = wx.StaticText(P, style=wx.ST_NO_AUTORESIZE | wx.ST_ELLIPSIZE_END, size=(-1, 22))
+        root.Add(self.est, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         # --- progress
-        gp = QGroupBox("Progress")
-        grid = QGridLayout(gp)
+        gp, S = group("Progress")
+        grid = wx.FlexGridSizer(4, 3, 4, 8)
+        grid.AddGrowableCol(1, 2)
+        grid.AddGrowableCol(2, 3)
         self.bars = {}
-        for r, (k, name) in enumerate([("overall", "Overall"), ("dl", "Download"),
-                                       ("load", "Load model"), ("tr", "Transcribe")]):
-            b, d = QProgressBar(), QLabel("")
-            b.setRange(0, 100)
-            grid.addWidget(QLabel(name), r, 0)
-            grid.addWidget(b, r, 1)
-            grid.addWidget(d, r, 2)
-            self.bars[k] = (b, d)
-        grid.setColumnStretch(1, 2)
-        grid.setColumnStretch(2, 3)
+        for k, name in (("overall", "Overall"), ("dl", "Download"), ("load", "Load model"), ("tr", "Transcribe")):
+            g = wx.Gauge(S, range=100, size=(-1, 18))
+            d = wx.StaticText(S, label="", style=wx.ST_NO_AUTORESIZE | wx.ST_ELLIPSIZE_END, size=(300, -1))
+            grid.Add(wx.StaticText(S, label=name), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(g, 1, wx.EXPAND | wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(d, 1, wx.EXPAND | wx.ALIGN_CENTER_VERTICAL)
+            self.bars[k] = (g, d)
+        add(gp, grid)
 
         # --- output
-        self.out = QTextEdit(readOnly=True)
-        self.logview = QPlainTextEdit(readOnly=True)
-        self.logview.setMaximumBlockCount(5000)
-        b_save, b_copy = QPushButton("Save as..."), QPushButton("Copy")
-        b_save.clicked.connect(self.save_current)
-        b_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.out.toPlainText()))
-        self.rtl = QCheckBox("Right-to-left view")
-        self.rtl.toggled.connect(self.set_rtl)
-        self.lang.currentTextChanged.connect(lambda t: self.rtl.setChecked(t.strip().lower() in RTL_LANGS))
-        page = QWidget()
-        lp = QVBoxLayout(page)
-        lp.addWidget(self.out)
-        lp.addLayout(hbox(b_save, b_copy, self.rtl, "-"))
-        tabs = QTabWidget()
-        tabs.addTab(page, "Transcript")
-        tabs.addTab(self.logview, "Log")
-        tabs.setMinimumHeight(240)
+        nb = wx.Notebook(P)
+        page = wx.Panel(nb)
+        self.out = wx.TextCtrl(page, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        b_save, b_copy = wx.Button(page, label="Save as..."), wx.Button(page, label="Copy")
+        b_save.Bind(wx.EVT_BUTTON, self.save_current)
+        b_copy.Bind(wx.EVT_BUTTON, self.copy_out)
+        self.rtl = wx.CheckBox(page, label="Right-to-left view")
+        pv = wx.BoxSizer(wx.VERTICAL)
+        pv.Add(self.out, 1, wx.EXPAND | wx.ALL, 3)
+        pv.Add(hrow(page, b_save, b_copy, self.rtl), 0, wx.ALL, 3)
+        page.SetSizer(pv)
+        self.logview = wx.TextCtrl(nb, style=wx.TE_MULTILINE | wx.TE_READONLY)
+        nb.AddPage(page, "Transcript")
+        nb.AddPage(self.logview, "Log")
+        nb.SetMinSize((-1, 260))
+        root.Add(nb, 1, wx.EXPAND | wx.ALL, 4)
 
-        central = QWidget()
-        v = QVBoxLayout(central)
-        for w in (self.g_model, self.g_opts, g_q, self.g_out):
-            v.addWidget(w)
-        v.addLayout(hbox(self.b_start, self.b_stop, self.b_unload, b_hist, "-"))
-        v.addWidget(self.est)
-        v.addWidget(gp)
-        v.addWidget(tabs, 1)
-        scroll = QScrollArea(widgetResizable=True)
-        scroll.setWidget(central)
-        self.setCentralWidget(scroll)
+        P.SetSizer(root)
+        P.SetupScrolling(scroll_x=False)
 
-        # --- settings persistence and live estimate
+        # --- settings persistence
         self.persist = {"model": self.model, "device": self.device, "compute": self.compute,
                         "threads": self.threads, "lang": self.lang, "rtl": self.rtl, "beam": self.beam,
                         "vad": self.vad, "words": self.words, "cond": self.cond,
-                        "batched": self.batched, "bsize": self.bsize, "prompt": self.prompt, "hotwords": self.hotwords,
-                        "outdir": self.outdir}
+                        "batched": self.batched, "bsize": self.bsize, "prompt": self.prompt,
+                        "hotwords": self.hotwords, "outdir": self.outdir}
         self.persist.update({f"fmt_{k}": c for k, c in self.fmt.items()})
         for k, w in self.persist.items():
-            v = self.settings.value(k)
-            if v is not None:
-                setv(w, v)
+            if k in self.settings.data:
+                setv(w, self.settings.data[k])
         if BatchedInferencePipeline is None:
-            self.batched.setChecked(False)
-        for w in (self.model, self.device, self.compute):
-            w.currentTextChanged.connect(self.refresh_estimate)
-        self.threads.valueChanged.connect(self.refresh_estimate)
-        self.batched.toggled.connect(self.refresh_estimate)
+            self.batched.SetValue(False)
+        self.set_rtl(self.rtl.GetValue())
+        self.on_model()
 
-        self.statusBar().showMessage("Ready")
+        # --- events (bound after loading settings so they don't fire during init)
+        for w in (self.device, self.compute):
+            w.Bind(wx.EVT_COMBOBOX, self.refresh_estimate)
+        self.model.Bind(wx.EVT_COMBOBOX, self.on_model)
+        self.model.Bind(wx.EVT_TEXT, self.on_model)
+        self.lang.Bind(wx.EVT_COMBOBOX, self.on_lang)
+        self.lang.Bind(wx.EVT_TEXT, self.on_lang)
+        self.threads.Bind(wx.EVT_SPINCTRL, self.refresh_estimate)
+        self.batched.Bind(wx.EVT_CHECKBOX, self.refresh_estimate)
+        self.rtl.Bind(wx.EVT_CHECKBOX, lambda e: self.set_rtl(self.rtl.GetValue()))
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+        self.timer = wx.Timer(self)  # animates busy bars and the model-load bar
+        self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
+        self.timer.Start(100)
+
+        self.set_drop(self)
+        self.CreateStatusBar()
+        self.SetStatusText("Ready")
         self.logline(f"faster-whisper {getattr(faster_whisper, '__version__', '?')} · timing data: {self.timings.path}")
         self.refresh_estimate()
+        self.Centre()
 
     # ---------------------------------------------------------- queue / files
-    def paths(self):
-        return [self.queue.item(i).data(Qt.UserRole) for i in range(self.queue.count())]
+    def set_drop(self, w):
+        try:
+            w.SetDropTarget(FileDrop(self))
+        except Exception:
+            pass
+        for c in w.GetChildren():
+            self.set_drop(c)
 
     def set_mark(self, i, mark):
-        p = self.queue.item(i).data(Qt.UserRole)
+        p = self.files[i]
         d = self.durations.get(p)
-        self.queue.item(i).setText(f"{mark}{os.path.basename(p)}" + (f"   [{hms(d)}]" if d else ""))
+        self.queue.SetString(i, f"{mark}{os.path.basename(p)}" + (f"   [{hms(d)}]" if d else ""))
 
     def add_paths(self, ps):
-        have = set(self.paths())
         for p in ps:
             if os.path.isdir(p):
                 self.add_paths(sorted(os.path.join(r, f) for r, _, fs in os.walk(p)
                                       for f in fs if f.lower().endswith(MEDIA_EXT)))
                 continue
-            if p in have or not os.path.isfile(p):
+            if p in self.files or not os.path.isfile(p):
                 continue
-            it = QListWidgetItem()
-            it.setData(Qt.UserRole, p)
-            it.setToolTip(p)
-            self.queue.addItem(it)
-            have.add(p)
+            self.files.append(p)
             self.durations[p] = probe(p)
-            self.set_mark(self.queue.count() - 1, "")
+            self.queue.Append("")
+            self.set_mark(len(self.files) - 1, "")
         self.refresh_estimate()
 
-    def pick_files(self):
-        fs, _ = QFileDialog.getOpenFileNames(
-            self, "Add audio/video", "",
-            "Media (" + " ".join("*" + e for e in MEDIA_EXT) + ");;All files (*)")
-        self.add_paths(fs)
+    def pick_files(self, e=None):
+        wild = "Media|" + ";".join("*" + x for x in MEDIA_EXT) + "|All files|*.*"
+        with wx.FileDialog(self, "Add audio/video", wildcard=wild,
+                           style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.add_paths(dlg.GetPaths())
 
-    def remove_selected(self):
-        for it in self.queue.selectedItems():
-            self.queue.takeItem(self.queue.row(it))
+    def remove_selected(self, e=None):
+        for i in sorted(self.queue.GetSelections(), reverse=True):
+            self.queue.Delete(i)
+            del self.files[i]
+        self.cur = -1
         self.refresh_estimate()
 
-    def clear_queue(self):
-        self.queue.clear()
+    def clear_queue(self, e=None):
+        self.queue.Clear()
+        self.files.clear()
         self.results.clear()
-        self.out.clear()
+        self.out.Clear()
+        self.cur = -1
         self.refresh_estimate()
 
-    def pick_model_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select CTranslate2 model folder")
-        if d:
-            self.model.setCurrentText(d)
+    def pick_model_dir(self, e=None):
+        with wx.DirDialog(self, "Select CTranslate2 model folder") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.model.SetValue(dlg.GetPath())
 
-    def pick_outdir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select output folder")
-        if d:
-            self.outdir.setText(d)
+    def pick_outdir(self, e=None):
+        with wx.DirDialog(self, "Select output folder") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.outdir.SetValue(dlg.GetPath())
 
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e):
-        self.add_paths([u.toLocalFile() for u in e.mimeData().urls()])
+    def on_queue_select(self, e):
+        sel = self.queue.GetSelections()
+        self.cur = sel[0] if sel else -1
+        self.show_current(self.cur)
 
     # -------------------------------------------------------------- settings
     def opts(self):
-        lang = self.lang.currentText().strip().lower()
-        return dict(device=self.device.currentText(), compute=self.compute.currentText(),
-                    threads=self.threads.value(), language=None if lang in ("", "auto") else lang,
-                    beam=self.beam.value(), vad=self.vad.isChecked(),
-                    batched=self.batched.isChecked() and BatchedInferencePipeline is not None,
-                    batch_size=self.bsize.value(), words=self.words.isChecked(),
-                    cond=self.cond.isChecked(), prompt=self.prompt.text().strip(),
-                    hotwords=self.hotwords.text().strip())
+        lang = self.lang.GetValue().strip().lower()
+        return dict(device=self.device.GetValue(), compute=self.compute.GetValue(),
+                    threads=self.threads.GetValue(), language=None if lang in ("", "auto") else lang,
+                    beam=self.beam.GetValue(), vad=self.vad.GetValue(),
+                    batched=self.batched.GetValue() and BatchedInferencePipeline is not None,
+                    batch_size=self.bsize.GetValue(), words=self.words.GetValue(),
+                    cond=self.cond.GetValue(), prompt=self.prompt.GetValue().strip(),
+                    hotwords=self.hotwords.GetValue().strip())
 
     def predict(self):
-        o, spec = self.opts(), self.model.currentText().strip()
+        o, spec = self.opts(), self.model.GetValue().strip()
         exact = {"model": spec, "device": o["device"], "compute": o["compute"],
                  "batched": o["batched"], "threads": o["threads"]}
         loose = {k: exact[k] for k in ("model", "device", "compute")}
@@ -719,13 +770,13 @@ class Main(QMainWindow):
                                                  {**loose, "load_cold": True})[0] or 0)
         return {"rtf": rtf, "n": n, "load": load}
 
-    def refresh_estimate(self, *_):
+    def refresh_estimate(self, e=None):
         if not hasattr(self, "est"):
             return
-        ps = self.paths()
+        ps = self.files
         known = [self.durations[p] for p in ps if self.durations.get(p)]
         if not ps:
-            self.est.setText("Add audio files to see a time estimate.")
+            self.est.SetLabel("Add audio files to see a time estimate.")
             return
         total = sum(known)
         text = f"Audio: {hms(total)}" + (" (some durations unknown)" if len(known) < len(ps) else "")
@@ -734,65 +785,72 @@ class Main(QMainWindow):
             text += f"  ·  Estimated time: ~{hms(p['load'] + total * p['rtf'])} (based on {p['n']} earlier run(s))"
         else:
             text += "  ·  No timing history for these settings yet; estimates start after the first run."
-        self.est.setText(text)
+        self.est.SetLabel(text)
+
+    def on_model(self, e=None):
+        self.model_help.SetLabel(MODELS.get(self.model.GetValue().strip(), ""))
+        self.refresh_estimate()
+
+    def on_lang(self, e=None):
+        on = self.lang.GetValue().strip().lower() in RTL_LANGS
+        self.rtl.SetValue(on)
+        self.set_rtl(on)
 
     def set_rtl(self, on):
-        opt = self.out.document().defaultTextOption()
-        opt.setTextDirection(Qt.RightToLeft if on else Qt.LeftToRight)
-        self.out.document().setDefaultTextOption(opt)
+        try:
+            self.out.SetLayoutDirection(wx.Layout_RightToLeft if on else wx.Layout_LeftToRight)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ run
     def busy(self, b):
         for w in (self.g_model, self.g_opts, self.g_out, self.b_start, self.b_unload, *self.qbtns):
-            w.setEnabled(not b)
-        self.b_stop.setEnabled(b)
+            w.Enable(not b)
+        self.b_stop.Enable(b)
         keep_awake(b)
 
     def start(self, download_only=False):
-        if self.job and self.job.isRunning():
+        if self.job and self.job.is_alive():
             return
-        spec = self.model.currentText().strip()
-        files = [] if download_only else self.paths()
+        spec = self.model.GetValue().strip()
+        files = [] if download_only else list(self.files)
         if not spec or (not os.path.isdir(spec) and spec.count("/") != 1):
-            QMessageBox.warning(self, "Model", "Enter a Hugging Face repo ID like user/name, or choose a local folder.")
+            wx.MessageBox("Enter a Hugging Face repo ID like user/name, or choose a local folder.",
+                          "Model", wx.ICON_WARNING)
             return
         if not download_only and not files:
-            QMessageBox.warning(self, "No files", "Add at least one audio file.")
+            wx.MessageBox("Add at least one audio file.", "No files", wx.ICON_WARNING)
             return
         self.results.clear()
-        self.out.clear()
-        for i in range(self.queue.count()):
+        self.out.Clear()
+        for i in range(len(self.files)):
             self.set_mark(i, "")
         for k in self.bars:
             self.on_bar(k, 0, "")
-        j = self.job = Worker(spec, files, self.opts(), self.predict(), download_only)
-        j.bar.connect(self.on_bar)
-        j.status.connect(self.statusBar().showMessage)
-        j.log.connect(self.logline)
-        j.loadstart.connect(self.on_loadstart)
-        j.filestart.connect(self.on_filestart)
-        j.segment.connect(self.on_segment)
-        j.result.connect(self.on_result)
-        j.record.connect(self.on_record)
-        j.failed.connect(self.on_failed)
-        j.finished.connect(self.on_finished)
+        self.job = Worker(self, spec, files, self.opts(), self.predict(), download_only)
         self.busy(True)
-        j.start()
+        self.job.start()
 
     def on_bar(self, which, pct, detail):
-        bar, lab = self.bars[which]
+        gauge, lab = self.bars[which]
         if pct < 0:
-            bar.setRange(0, 0)
+            self.pulsing.add(which)
+            gauge.Pulse()
         else:
-            bar.setRange(0, 100)
-            bar.setValue(pct)
-        lab.setText(detail)
+            self.pulsing.discard(which)
+            gauge.SetValue(min(pct, 100))
+        lab.SetLabel(detail)
         if which == "load" and pct >= 100:
-            self.load_timer.stop()
+            self.load_active = False
+
+    def on_timer(self, e):
+        for k in list(self.pulsing):
+            self.bars[k][0].Pulse()
+        if self.load_active:
+            self.tick_load()
 
     def on_loadstart(self, pred):
-        self.load_t0, self.load_pred = time.time(), pred
-        self.load_timer.start()
+        self.load_t0, self.load_pred, self.load_active = time.time(), pred, True
         self.tick_load()
 
     def tick_load(self):
@@ -804,18 +862,21 @@ class Main(QMainWindow):
             self.on_bar("load", -1, f"Loading... {hms(el)}")
 
     def on_filestart(self, i):
-        p = self.paths()[i]
-        self.results[p] = []
+        self.results[self.files[i]] = []
         self.set_mark(i, "▶ ")
-        self.queue.setCurrentRow(i)
+        for s in self.queue.GetSelections():
+            self.queue.Deselect(s)
+        self.queue.SetSelection(i)
+        self.cur = i
+        self.show_current(i)
 
     def on_segment(self, i, seg):
-        self.results[self.paths()[i]].append(seg)
-        if self.queue.currentRow() == i:
-            self.out.append(fmt_seg(seg))
+        self.results[self.files[i]].append(seg)
+        if self.cur == i:
+            self.out.AppendText(fmt_seg(seg) + "\n")
 
     def on_result(self, i, segs, rec):
-        p = self.paths()[i]
+        p = self.files[i]
         self.results[p] = segs
         self.set_mark(i, "✓ " if rec else "◐ ")
         if rec:
@@ -829,20 +890,23 @@ class Main(QMainWindow):
 
     def on_failed(self, msg):
         self.logline("ERROR " + msg)
-        self.statusBar().showMessage("Failed")
-        QMessageBox.critical(self, "Error", msg)
+        self.SetStatusText("Failed")
+        wx.MessageBox(msg, "Error", wx.ICON_ERROR)
 
     def on_finished(self):
-        self.load_timer.stop()
+        self.load_active = False
         self.busy(False)
-        for i in range(self.queue.count()):
-            if self.queue.item(i).text().startswith("▶"):
+        for i in range(self.queue.GetCount()):
+            if self.queue.GetString(i).startswith("▶"):
                 self.set_mark(i, "✗ ")
         self.refresh_estimate()
-        QApplication.alert(self)  # flash the taskbar button
+        self.RequestUserAttention()  # flash the taskbar button
 
-    def unload(self):
-        if self.job and self.job.isRunning():
+    def set_status(self, s):
+        self.SetStatusText(s)
+
+    def unload(self, e=None):
+        if self.job and self.job.is_alive():
             return
         _MODELS.clear()
         gc.collect()
@@ -851,53 +915,67 @@ class Main(QMainWindow):
 
     # --------------------------------------------------------------- output
     def show_current(self, row):
-        if row < 0:
+        if row < 0 or row >= len(self.files):
             return
-        segs = self.results.get(self.queue.item(row).data(Qt.UserRole), [])
-        self.out.setPlainText("\n".join(fmt_seg(s) for s in segs))
+        segs = self.results.get(self.files[row], [])
+        self.out.SetValue("\n".join(fmt_seg(s) for s in segs))
 
     def autosave(self, path, segs):
-        out_dir = self.outdir.text().strip() or os.path.dirname(path)
+        out_dir = self.outdir.GetValue().strip() or os.path.dirname(path)
         base = os.path.splitext(os.path.basename(path))[0]
         for f, cb in self.fmt.items():
-            if cb.isChecked():
+            if cb.GetValue():
                 try:
                     os.makedirs(out_dir, exist_ok=True)
                     target = os.path.join(out_dir, f"{base}.{f}")
                     write_out(target, segs, f)
                     self.logline(f"Saved {target}")
-                except OSError as e:
-                    self.logline(f"ERROR saving {base}.{f}: {e}")
+                except OSError as ex:
+                    self.logline(f"ERROR saving {base}.{f}: {ex}")
 
-    def save_current(self):
-        row = self.queue.currentRow()
-        segs = self.results.get(self.queue.item(row).data(Qt.UserRole)) if row >= 0 else None
+    def save_current(self, e=None):
+        row = self.cur
+        segs = self.results.get(self.files[row]) if 0 <= row < len(self.files) else None
         if not segs:
             return
-        base = os.path.splitext(self.queue.item(row).data(Qt.UserRole))[0]
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save transcript", base + ".txt",
-            "Text (*.txt);;SubRip (*.srt);;WebVTT (*.vtt);;JSON (*.json)")
-        if path:
-            write_out(path, segs, os.path.splitext(path)[1].lstrip(".").lower() or "txt")
-            self.statusBar().showMessage(f"Saved {path}")
+        base = os.path.splitext(self.files[row])[0]
+        wild = "Text (*.txt)|*.txt|SubRip (*.srt)|*.srt|WebVTT (*.vtt)|*.vtt|JSON (*.json)|*.json"
+        with wx.FileDialog(self, "Save transcript", defaultDir=os.path.dirname(base),
+                           defaultFile=os.path.basename(base) + ".txt", wildcard=wild,
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if ext not in FORMATS:
+                ext = FORMATS[dlg.GetFilterIndex()]
+                path += "." + ext
+        write_out(path, segs, ext)
+        self.SetStatusText(f"Saved {path}")
+
+    def copy_out(self, e=None):
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(self.out.GetValue()))
+            wx.TheClipboard.Close()
 
     def logline(self, s):
-        self.logview.appendPlainText(f"{datetime.now():%H:%M:%S}  {s}")
+        self.logview.AppendText(f"{datetime.now():%H:%M:%S}  {s}\n")
 
-    def closeEvent(self, e):
-        if self.job and self.job.isRunning():
+    def on_close(self, e):
+        self.closing = True
+        self.timer.Stop()
+        if self.job and self.job.is_alive():
             self.job.stop()
-            self.job.wait(8000)
-        for k, w in self.persist.items():
-            self.settings.setValue(k, getv(w))
-        super().closeEvent(e)
+            self.job.join(8)
+        self.settings.data = {k: getv(w) for k, w in self.persist.items()}
+        self.settings.save()
+        self.Destroy()
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName("WhisperGUI")
+    app = wx.App(False)
+    app.SetAppName("WhisperGUI")
     install_crash_handler()
-    win = Main()
-    win.show()
-    sys.exit(app.exec())
+    frame = Main()
+    frame.Show()
+    app.MainLoop()
