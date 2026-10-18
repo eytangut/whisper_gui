@@ -1,6 +1,9 @@
+#ifndef AppVersion
+  #define AppVersion "1.0"
+#endif
 [Setup]
 AppName=Whisper GUI
-AppVersion=1.0
+AppVersion={#AppVersion}
 DefaultDirName={autopf}\WhisperGUI
 DefaultGroupName=Whisper GUI
 OutputDir=installer
