@@ -1,21 +1,51 @@
-name: build-windows
-on: [push, workflow_dispatch]
+name: release-windows
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install -U pyside6 faster-whisper huggingface_hub pyinstaller
-      - run: >
+
+      - name: Build exe folder
+        run: >
           pyinstaller --noconfirm --onedir --windowed --name WhisperGUI
           --collect-all faster_whisper --collect-all ctranslate2 --collect-all av
           --collect-all huggingface_hub --collect-all tokenizers whisper_gui.py
-      - run: choco install innosetup -y
-      - run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
-      - uses: actions/upload-artifact@v4
+
+      - name: Zip
+        run: Compress-Archive -Path dist\WhisperGUI -DestinationPath WhisperGUI-windows.zip
+
+      - name: Build installer
+        run: |
+          choco install innosetup -y
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") } else { $v = "0.0.0-dev" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" installer.iss
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "${{ github.ref_name }}" WhisperGUI-windows.zip installer/WhisperGUI-Setup.exe --generate-notes
+
+      - name: Keep files as artifacts (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
         with:
-          name: WhisperGUI-Setup
-          path: installer/WhisperGUI-Setup.exe
+          name: WhisperGUI
+          path: |
+            WhisperGUI-windows.zip
+            installer/WhisperGUI-Setup.exe
